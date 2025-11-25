@@ -31,7 +31,7 @@ def load_model(model_type, device):
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    state = torch.load(ckpt, map_location=device)
+    state = torch.load(ckpt, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
 
@@ -175,9 +175,7 @@ def main():
         dataset = SERDataset()
         print("\nCompression robustness ")
         for br in bitrates:
-            acc_c, f1_c, uar_c = evaluate_compression_for_bitrate(
-                model, dataset, device, bitrate=br
-            )
+            acc_c, f1_c, uar_c = evaluate_compression_for_bitrate(model, dataset, device, bitrate=br)
             print(f"{br}: Acc={acc_c:.4f} | Macro-F1={f1_c:.4f} | UAR={uar_c:.4f}")
 
 
