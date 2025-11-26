@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from src import config, features
 from src.models import CRNN, SERTransformer
 
-app = FastAPI(title="SER FastAPI", version="1.2")
+app = FastAPI(title="SER FastAPI", version="1.3")
 
 EMO_LABELS = ["neutral", "happy", "sad", "angry", "fearful", "disgust"]
 
@@ -52,7 +52,7 @@ def load_model(model_type: str) -> torch.nn.Module:
     model = _build_model(mt).to(DEVICE)
     ckpt = _ckpt_for(mt)
 
-    # Safer loading; fallback for older torch
+    # Safer load (new torch), fallback for older torch
     try:
         state = torch.load(ckpt, map_location=DEVICE, weights_only=True)
     except TypeError:
@@ -70,6 +70,7 @@ def convert_any_audio_to_wav(in_path: str, out_wav_path: str) -> None:
     """
     cmd = [
         FFMPEG_BIN, "-y",
+        "-hide_banner",
         "-loglevel", "error",
         "-i", in_path,
         "-ac", "1",
@@ -149,8 +150,7 @@ def demo():
     .muted {{ color:#6b7280; font-size:13px; }}
     .pill {{ display:inline-block; padding: 4px 10px; border-radius: 999px; background:#eef2ff; color:#3730a3; font-weight:600; font-size:13px; }}
     pre {{ background:#0b1020; color:#e5e7eb; padding:12px; border-radius:12px; overflow:auto; }}
-    .ok {{ color:#059669; font-weight:700; }}
-    .bad {{ color:#dc2626; font-weight:700; }}
+    hr {{ border:none; border-top:1px solid #e5e7eb; margin:16px 0; }}
   </style>
 </head>
 <body>
@@ -158,7 +158,7 @@ def demo():
     <h1>Speech Emotion Recognition — Upload + Microphone</h1>
     <div class="muted">
       Labels: <span class="pill">{", ".join(EMO_LABELS)}</span> &nbsp; | &nbsp;
-      Mic mode sends a chunk every <b>3s</b> and updates prediction
+      Mic mode sends a <b>5s</b> segment and updates prediction.
     </div>
 
     <br/>
@@ -170,7 +170,7 @@ def demo():
       </select>
     </div>
 
-    <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+    <hr/>
 
     <h3>1) Upload audio file</h3>
     <div class="row">
@@ -178,16 +178,16 @@ def demo():
       <button id="btnUpload">Upload</button>
     </div>
 
-    <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+    <hr/>
 
-    <h3>2) Microphone </h3>
+    <h3>2) Microphone (real-time segments)</h3>
     <div class="row">
       <button id="btnMicStart">Start Mic</button>
       <button id="btnMicStop" disabled>Stop Mic</button>
       <span id="micStatus" class="muted">Mic: idle</span>
     </div>
     <div class="muted" style="margin-top:8px;">
-      If Mic fails: check site permissions (Chrome lock icon) and ensure no other app is blocking the microphone.
+      If Mic fails: allow permissions (Chrome lock icon), and ensure no other app is blocking the microphone.
     </div>
 
     <h3>Result</h3>
@@ -198,7 +198,7 @@ def demo():
   const out = document.getElementById("out");
   const modelType = document.getElementById("modelType");
 
-  // Upload predict
+  // Upload
   document.getElementById("btnUpload").addEventListener("click", async () => {{
     const f = document.getElementById("fileInput").files?.[0];
     if (!f) {{
@@ -211,103 +211,97 @@ def demo():
       fd.append("file", f);
       const url = `/predict?model_type=${{encodeURIComponent(modelType.value)}}`;
       const res = await fetch(url, {{ method:"POST", body: fd }});
-      const data = await res.json();
-      out.textContent = JSON.stringify(data, null, 2);
+      out.textContent = JSON.stringify(await res.json(), null, 2);
     }} catch (e) {{
       out.textContent = "Error: " + e;
     }}
   }});
 
-  // Mic streaming-ish
+  // Mic recording in FULL 3s segments (stop -> upload -> restart)
   let stream = null;
-  let recorder = null;
-  let sending = false;
+  let running = false;
 
   const micStatus = document.getElementById("micStatus");
   const btnStart = document.getElementById("btnMicStart");
   const btnStop  = document.getElementById("btnMicStop");
 
-  function setStatus(msg) {{
-    micStatus.textContent = msg;
+  function setStatus(msg) {{ micStatus.textContent = msg; }}
+
+  function pickMimeType() {{
+    const tryTypes = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg"
+    ];
+    for (const t of tryTypes) {{
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+    }}
+    return "";
   }}
 
-  async function sendBlob(blob) {{
-    if (sending) return; // avoid overlap
-    sending = true;
-    try {{
-      const fd = new FormData();
-      // Name matters only for suffix; backend ffmpeg handles format
-      fd.append("file", blob, "mic.webm");
-      const url = `/predict?model_type=${{encodeURIComponent(modelType.value)}}`;
-      const res = await fetch(url, {{ method:"POST", body: fd }});
-      const data = await res.json();
-      out.textContent = JSON.stringify(data, null, 2);
-    }} catch (e) {{
-      out.textContent = "Mic send error: " + e;
-    }} finally {{
-      sending = false;
+  async function sendBlob(blob, filename) {{
+    if (!blob || blob.size < 2000) {{
+      out.textContent = "Mic chunk too small/empty. Try again.";
+      return;
     }}
+    out.textContent = "Running inference (mic)...";
+    const fd = new FormData();
+    fd.append("file", blob, filename);
+    const url = `/predict?model_type=${{encodeURIComponent(modelType.value)}}`;
+    const res = await fetch(url, {{ method:"POST", body: fd }});
+    out.textContent = JSON.stringify(await res.json(), null, 2);
+  }}
+
+  function recordOneSegment(seconds=5) {{
+    if (!running || !stream) return;
+
+    const mimeType = pickMimeType();
+    const chunks = [];
+    const rec = new MediaRecorder(stream, mimeType ? {{ mimeType }} : undefined);
+
+    rec.ondataavailable = (e) => {{
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    }};
+
+    rec.onstop = async () => {{
+      const type = rec.mimeType || "audio/webm";
+      const blob = new Blob(chunks, {{ type }});
+      const ext = type.includes("ogg") ? "ogg" : "webm";
+      await sendBlob(blob, `mic.${{ext}}`);
+      if (running) recordOneSegment(seconds);
+    }};
+
+    rec.start(); // IMPORTANT: no timeslice => complete container output
+    setTimeout(() => {{ try {{ rec.stop(); }} catch {{}} }}, seconds * 1000);
   }}
 
   btnStart.addEventListener("click", async () => {{
     out.textContent = "Requesting microphone...";
     try {{
       stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
-
-      // Prefer opus if available
-      let options = {{}};
-      const tryTypes = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/ogg;codecs=opus"
-      ];
-      for (const t of tryTypes) {{
-        if (MediaRecorder.isTypeSupported(t)) {{
-          options.mimeType = t;
-          break;
-        }}
-      }}
-
-      recorder = new MediaRecorder(stream, options);
-
-      recorder.onstart = () => {{
-        setStatus("Mic: recording (sending every 3s)...");
-        btnStart.disabled = true;
-        btnStop.disabled = false;
-        out.textContent = "Mic recording started...";
-      }};
-
-      recorder.ondataavailable = async (evt) => {{
-        if (evt.data && evt.data.size > 0) {{
-          await sendBlob(evt.data);
-        }}
-      }};
-
-      recorder.onstop = () => {{
-        setStatus("Mic: idle");
-        btnStart.disabled = false;
-        btnStop.disabled = true;
-        out.textContent = "Mic stopped.";
-      }};
-
-      // timeslice=3000ms => real-time"
-      recorder.start(3000);
-
+      running = true;
+      setStatus("Mic: recording (3s segments)...");
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      recordOneSegment(5);
     }} catch (e) {{
+      running = false;
       setStatus("Mic: error");
       out.textContent = "Microphone error: " + e;
     }}
   }});
 
   btnStop.addEventListener("click", () => {{
+    running = false;
     try {{
-      if (recorder && recorder.state !== "inactive") recorder.stop();
-      if (stream) {{
-        stream.getTracks().forEach(t => t.stop());
-      }}
-    }} catch (e) {{
-      out.textContent = "Stop error: " + e;
-    }}
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    }} catch {{}}
+    stream = null;
+    setStatus("Mic: idle");
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    out.textContent = "Mic stopped.";
   }});
 </script>
 </body>
@@ -338,6 +332,5 @@ async def predict(file: UploadFile = File(...), model_type: str = "crnn"):
 
 # Run:
 # python -m uvicorn app:app --host 127.0.0.1 --port 9000
-
-#for demo, visit:
-#http://127.0.0.1:9000/demo
+# Demo:
+# http://127.0.0.1:9000/demo
